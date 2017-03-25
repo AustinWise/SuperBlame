@@ -1,0 +1,9 @@
+*.suo
+*proj.user
+bin
+obj
+*.cache
+TestResults
+packages
+*.psess
+*.vsp
