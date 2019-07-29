@@ -12,25 +12,6 @@ namespace SuperBlame
 {
     class Program
     {
-        private static readonly Dictionary<string, string> NameMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-        {
-            { "Niesner, Eduard (Consultant)", "Eduard Niesner" },
-            { "3lpeana","Lucian Peana" },
-            { "Cirstea, Cosmin", "Cosmin Cirstea" },
-            { "Florea, Sergiu (Consultant)", "Sergiu Florea" },
-            { "Dinh, Anthony", "Anthony Dinh" },
-            { "Cosas, Deian (Consultant)", "Deian Cosas" },
-            { "Wrye, Nathanael", "Nathanael Wrye" },
-            { "dsun", "David Sun" },
-            { "Sun, David", "David Sun" },
-            { "Wang", "Roy Wang" },
-            { "admin", "unknown" },
-            { "Graciano, Justo", "Justo Graciano" },
-            { "Adam, Florin (Consultant)", "Florin Adam" },
-            { "Merrill, Jeffrey", "Jeffrey Merrill" },
-            { "Carra-Farago, Adina (Consultant)", "Adina Carra-Farago" },
-        };
-
         private static readonly SortedSet<string> sInitalInportCommits = new SortedSet<string>()
         {
             "93ba65338271090e9bdb8df4481b11b091a7acab",
@@ -64,7 +45,7 @@ namespace SuperBlame
                 new Func<string, Task<LineCount>>(ProcessBlame),
                 new ExecutionDataflowBlockOptions()
                 {
-                    MaxDegreeOfParallelism = 12
+                    MaxDegreeOfParallelism = Environment.ProcessorCount,
                 });
 
             var batcher = new BatchBlock<LineCount>(100);
@@ -115,13 +96,10 @@ namespace SuperBlame
                     foreach (var kvp in lc.ByAuthor)
                     {
                         int currentCount;
-                        string realName;
-                        if (!NameMap.TryGetValue(kvp.Key, out realName))
-                            realName = kvp.Key;
-                        if (!totalSum.ByAuthor.TryGetValue(realName, out currentCount))
+                        if (!totalSum.ByAuthor.TryGetValue(kvp.Key, out currentCount))
                             currentCount = 0;
                         currentCount += kvp.Value;
-                        totalSum.ByAuthor[realName] = currentCount;
+                        totalSum.ByAuthor[kvp.Key] = currentCount;
                     }
                     foreach (var kvp in lc.ByUnixTimeStamp)
                     {
