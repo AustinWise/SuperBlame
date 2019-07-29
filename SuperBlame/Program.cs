@@ -1,11 +1,10 @@
 ﻿using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
+using System.IO;
 using System.Linq;
 using System.Text;
-using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Threading.Tasks.Dataflow;
 
@@ -61,55 +60,76 @@ namespace SuperBlame
             if (p.ExitCode != 0)
                 throw new Exception();
 
-
-            var sumEachFile = new TransformBlock<string, Dictionary<string, int>>(
-                new Func<string, Task<Dictionary<string, int>>>(ProcessBlame),
+            var sumEachFile = new TransformBlock<string, LineCount>(
+                new Func<string, Task<LineCount>>(ProcessBlame),
                 new ExecutionDataflowBlockOptions()
                 {
                     MaxDegreeOfParallelism = 12
                 });
 
-            var batcher = new BatchBlock<Dictionary<string, int>>(100);
+            var batcher = new BatchBlock<LineCount>(100);
 
             var linkOption = new DataflowLinkOptions() { PropagateCompletion = true };
             sumEachFile.LinkTo(batcher, linkOption);
 
-            var tIn = PushAllIn(stuff, sumEachFile);
+            var tIn = Task.Run(() => PushAllIn(stuff, sumEachFile));
 
-            var tOut = GetAllOut(batcher);
+            var tOut = Task.Run(() => GetAllOut(batcher));
 
             await Task.WhenAll(tIn, tOut);
 
             var total = await tOut;
 
-            foreach (var kvp in total.OrderByDescending(kvp => kvp.Value))
+            using (var sw = new StreamWriter("countByAuthor.csv"))
             {
-                Console.WriteLine($"{kvp.Key}: {kvp.Value}");
+                foreach (var kvp in total.ByAuthor.OrderByDescending(kvp => kvp.Value))
+                {
+                    await sw.WriteLineAsync($"{kvp.Key},{kvp.Value}");
+                }
             }
 
-            Console.WriteLine();
+            using (var sw = new StreamWriter("countByTimeStamp.csv"))
+            {
+                var q = total.ByUnixTimeStamp.Select(kvp => Tuple.Create(DateTimeOffset.FromUnixTimeSeconds(kvp.Key), kvp.Value))
+                                             .GroupBy(tup => tup.Item1.Date)
+                                             .OrderByDescending(group => group.Key);
+                foreach (var day in q)
+                {
+                    await sw.WriteLineAsync($"{day.Key:yyyy/MM/dd},{day.Sum(s => s.Item2)}");
+                }
+            }
+
+            Console.WriteLine("Done.");
         }
 
-        private static async Task<Dictionary<string, int>> GetAllOut(BatchBlock<Dictionary<string, int>> batcher)
+        private static async Task<LineCount> GetAllOut(BatchBlock<LineCount> batcher)
         {
-            var totalSum = new Dictionary<string, int>();
+            var totalSum = new LineCount();
             while (await batcher.OutputAvailableAsync())
             {
-                Dictionary<string, int>[] batchedDicList;
+                LineCount[] batchedDicList;
                 if (!batcher.TryReceive(out batchedDicList))
                     continue;
-                foreach (var dic in batchedDicList)
+                foreach (var lc in batchedDicList)
                 {
-                    foreach (var kvp in dic)
+                    foreach (var kvp in lc.ByAuthor)
                     {
                         int currentCount;
                         string realName;
                         if (!NameMap.TryGetValue(kvp.Key, out realName))
                             realName = kvp.Key;
-                        if (!totalSum.TryGetValue(realName, out currentCount))
+                        if (!totalSum.ByAuthor.TryGetValue(realName, out currentCount))
                             currentCount = 0;
                         currentCount += kvp.Value;
-                        totalSum[realName] = currentCount;
+                        totalSum.ByAuthor[realName] = currentCount;
+                    }
+                    foreach (var kvp in lc.ByUnixTimeStamp)
+                    {
+                        int currentCount;
+                        if (!totalSum.ByUnixTimeStamp.TryGetValue(kvp.Key, out currentCount))
+                            currentCount = 0;
+                        currentCount += kvp.Value;
+                        totalSum.ByUnixTimeStamp[kvp.Key] = currentCount;
                     }
                 }
             }
@@ -117,7 +137,7 @@ namespace SuperBlame
             return totalSum;
         }
 
-        private static async Task PushAllIn(string[] stuff, TransformBlock<string, Dictionary<string, int>> sumEachFile)
+        private static async Task PushAllIn(string[] stuff, TransformBlock<string, LineCount> sumEachFile)
         {
             foreach (var file in stuff)
             {
@@ -129,9 +149,9 @@ namespace SuperBlame
         }
 
         static readonly char[] Space = new[] { ' ' };
-        static async Task<Dictionary<string, int>> ProcessBlame(string filePath)
+        static async Task<LineCount> ProcessBlame(string filePath)
         {
-            var ret = new Dictionary<string, int>();
+            var ret = new LineCount();
             if (string.IsNullOrEmpty(filePath))
                 return ret;
             if (filePath.EndsWith(".designer.cs", StringComparison.OrdinalIgnoreCase))
@@ -141,6 +161,7 @@ namespace SuperBlame
             var stdout = p.StandardOutput;
 
             var commitToAuthorMap = new Dictionary<string, string>();
+            var commitToTimestampMap = new Dictionary<string, long>();
 
 #if DEBUG
             var sb = new StringBuilder();
@@ -159,7 +180,7 @@ namespace SuperBlame
                 if (splits.Length != 4 || splits[0].Length != 40)
                 {
                     Console.WriteLine("bad: " + filePath);
-                    return new Dictionary<string, int>();
+                    return new LineCount();
                 }
 
                 string hash = splits[0];
@@ -171,7 +192,8 @@ namespace SuperBlame
 
                 if (commitToAuthorMap.ContainsKey(hash))
                 {
-                    ret[commitToAuthorMap[hash]] += lineCount;
+                    ret.ByAuthor[commitToAuthorMap[hash]] += lineCount;
+                    ret.ByUnixTimeStamp[commitToTimestampMap[hash]] += lineCount;
                     linesToEat -= 1;
                 }
                 else
@@ -179,6 +201,7 @@ namespace SuperBlame
                     linesToEat -= 2;
 
                     string author = null;
+                    long? authorTime = null;
                     while (null != (line = await stdout.ReadLineAsync()))
                     {
 #if DEBUG
@@ -187,21 +210,36 @@ namespace SuperBlame
 
                         if (line[0] == '\t')
                             break;
+
                         const string AUTHOR = "author ";
+                        const string AUTHOR_TIME = "author-time ";
+
                         if (line.StartsWith(AUTHOR))
                         {
                             author = line.Substring(AUTHOR.Length);
                         }
+                        else if (line.StartsWith(AUTHOR_TIME))
+                        {
+                            authorTime = long.Parse(line.Substring(AUTHOR_TIME.Length));
+                        }
                     }
 
-                    if (author == null)
+                    if (author == null || authorTime == null)
                         throw new Exception();
 
                     commitToAuthorMap[hash] = author;
-                    if (ret.ContainsKey(author))
-                        ret[author] += lineCount;
-                    else
-                        ret.Add(author, lineCount);
+                    int countForAuthor;
+                    if (!ret.ByAuthor.TryGetValue(author, out countForAuthor))
+                        countForAuthor = 0;
+                    countForAuthor += lineCount;
+                    ret.ByAuthor[author] = countForAuthor;
+
+                    commitToTimestampMap[hash] = authorTime.Value;
+                    int countForTimeStamp;
+                    if (!ret.ByUnixTimeStamp.TryGetValue(authorTime.Value, out countForTimeStamp))
+                        countForTimeStamp = 0;
+                    countForTimeStamp += lineCount;
+                    ret.ByUnixTimeStamp[authorTime.Value] = countForTimeStamp;
                 }
 
                 for (int i = 0; i < linesToEat; i++)
@@ -215,10 +253,18 @@ namespace SuperBlame
                 }
             }
 
+            p.WaitForExit();
+
             if (p.ExitCode != 0)
                 throw new Exception();
 
             return ret;
+        }
+
+        class LineCount
+        {
+            public Dictionary<string, int> ByAuthor { get; } = new Dictionary<string, int>();
+            public Dictionary<long, int> ByUnixTimeStamp { get; } = new Dictionary<long, int>();
         }
 
         static Process StartWithOutputRedirect(string args)
